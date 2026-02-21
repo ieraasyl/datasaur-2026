@@ -1,0 +1,11 @@
+{
+  "submission_name": "FCB",
+  "total_protocols": 198,
+  "accuracy_at_1_percent": 1.01,
+  "recall_at_3_percent": 5.56,
+  "latency_avg_s": 22.824,
+  "latency_min_s": 0.89,
+  "latency_max_s": 55.904,
+  "latency_p50_s": 22.205,
+  "latency_p95_s": 44.317
+}

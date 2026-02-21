@@ -19,15 +19,15 @@ class Settings(BaseSettings):
     corpus_dir: Path = BASE_DIR / "data" / "corpus"
     static_dir: Path = BASE_DIR.parent / "static"  # Astro build output
 
-    # Embedding model (multilingual-e5-small: ~120MB, excellent Russian support)
-    embed_model: str = "intfloat/multilingual-e5-small"
+    # Embedding model (multilingual-e5-base: ~1.1GB, strong multilingual retrieval)
+    embed_model: str = "intfloat/multilingual-e5-base"
     
     # Chunking parameters
-    chunk_size: int = 600  # tokens (words)
-    chunk_overlap: int = 100
+    chunk_size: int = 512  # tokens (words)
+    chunk_overlap: int = 80
     
     # Retrieval parameters
-    top_k: int = 10  # chunks per retriever
+    top_k: int = 25  # chunks per retriever (more candidates for better protocol coverage)
     top_n_diag: int = 5  # diagnoses returned
     rrf_k: int = 60  # RRF constant
     

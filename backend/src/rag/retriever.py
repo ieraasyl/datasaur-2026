@@ -1,5 +1,6 @@
 """Hybrid retriever: FAISS (dense) + BM25 (sparse) fused via Reciprocal Rank Fusion."""
 import logging
+from collections import defaultdict
 
 import numpy as np
 
@@ -32,7 +33,6 @@ def reciprocal_rank_fusion(
     items: dict[str, dict] = {}
 
     for rank, chunk in enumerate(dense_results):
-        # Handle both chunk_index and chunk_idx field names
         chunk_idx = chunk.get("chunk_index", chunk.get("chunk_idx", 0))
         key = f"{chunk['protocol_id']}:{chunk_idx}"
         scores[key] = scores.get(key, 0.0) + _rrf_score(rank, k)
@@ -47,6 +47,48 @@ def reciprocal_rank_fusion(
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
     return [{**items[k], "rrf_score": s} for k, s in ranked]
+
+
+def aggregate_by_protocol(chunks: list[dict], top_protocols: int = 5) -> list[dict]:
+    """
+    Aggregate chunk-level scores by protocol_id.
+    Returns chunks re-ordered so that chunks from the highest-scoring protocols
+    come first, preserving intra-protocol chunk ordering by score.
+    """
+    protocol_data: dict[str, dict] = defaultdict(
+        lambda: {"total_score": 0.0, "max_score": 0.0, "chunk_count": 0, "chunks": []}
+    )
+
+    for c in chunks:
+        pid = c["protocol_id"]
+        score = c.get("reranker_score", c.get("rrf_score", 0.0))
+        protocol_data[pid]["total_score"] += score
+        protocol_data[pid]["max_score"] = max(protocol_data[pid]["max_score"], score)
+        protocol_data[pid]["chunk_count"] += 1
+        protocol_data[pid]["chunks"].append(c)
+
+    ranked_protocols = sorted(
+        protocol_data.items(),
+        key=lambda x: (x[1]["max_score"], x[1]["total_score"]),
+        reverse=True,
+    )[:top_protocols]
+
+    result: list[dict] = []
+    for pid, data in ranked_protocols:
+        sorted_chunks = sorted(
+            data["chunks"],
+            key=lambda c: c.get("reranker_score", c.get("rrf_score", 0.0)),
+            reverse=True,
+        )
+        for c in sorted_chunks:
+            c["protocol_rank_score"] = data["max_score"]
+        result.extend(sorted_chunks)
+
+    logger.debug(
+        f"Protocol aggregation: {len(chunks)} chunks → "
+        f"{len(ranked_protocols)} protocols → {len(result)} chunks"
+    )
+    return result
 
 
 class HybridRetriever:

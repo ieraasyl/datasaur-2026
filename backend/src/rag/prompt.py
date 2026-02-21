@@ -1,70 +1,103 @@
 """Prompt templates for the GPT-OSS clinical reasoning call."""
+from collections import defaultdict
 
-SYSTEM_PROMPT = """Ты — AI-ассистент клинической диагностики по протоколам Минздрава РК.
+SYSTEM_PROMPT = """Ты — AI-ассистент клинической диагностики по протоколам Минздрава Республики Казахстан.
 
-Правила:
-1. Используй ТОЛЬКО коды МКБ-10, явно указанные в предоставленных фрагментах протоколов. ЗАПРЕЩЕНО придумывать коды.
-2. Выбирай САМЫЙ СПЕЦИФИЧЕСКИЙ код (с десятичной частью, если есть).
-3. Ранг 1 = наиболее вероятный диагноз.
-4. Верни ТОЛЬКО валидный JSON-массив, без markdown и пояснений до/после.
+Задача: по описанию симптомов пациента определить наиболее вероятный диагноз и его код МКБ-10, опираясь ТОЛЬКО на предоставленные фрагменты клинических протоколов.
 
-Формат ответа — JSON-массив:
-[{"rank":1,"diagnosis":"Название","icd10_code":"X00.0","explanation":"1 предложение"}]"""
+Алгоритм:
+1. Внимательно прочитай описание симптомов пациента.
+2. Определи, какой из предоставленных протоколов наиболее соответствует описанным симптомам.
+3. Из этого протокола выбери САМЫЙ СПЕЦИФИЧЕСКИЙ код МКБ-10 (с десятичной частью, если есть), который лучше всего описывает состояние пациента.
+4. ЗАПРЕЩЕНО придумывать коды — используй ТОЛЬКО коды, явно указанные в протоколах.
 
-DIAGNOSIS_PROMPT = """## Симптомы:
+Формат ответа — строго JSON:
+{"diagnoses":[{"rank":1,"diagnosis":"Название диагноза","icd10_code":"X00.0","explanation":"Краткое обоснование"}]}"""
+
+DIAGNOSIS_PROMPT = """## Симптомы пациента:
 {symptoms}
 
-## Возможные коды МКБ-10 из найденных протоколов:
-{icd_list}
-
-## Релевантные клинические протоколы РК:
+## Найденные клинические протоколы РК:
 {context}
 
-Определи до {top_n} наиболее вероятных диагнозов. Используй ТОЛЬКО коды из протоколов выше.
-Верни JSON-массив:"""
+## Доступные коды МКБ-10 (из протоколов выше):
+{icd_list}
+
+Проанализируй симптомы и определи до {top_n} наиболее вероятных диагнозов.
+Для каждого диагноза укажи конкретный код МКБ-10 из списка выше, который ЛУЧШЕ ВСЕГО соответствует описанным симптомам.
+Верни JSON:"""
 
 
-def build_context(chunks: list[dict], max_chars: int = 6000) -> str:
-    """Format retrieved protocol chunks into LLM context string."""
-    parts = []
-    total = 0
-    seen_protocols: set[str] = set()
+def build_context(chunks: list[dict], max_chars: int = 14000) -> str:
+    """Format retrieved chunks grouped by protocol for clearer LLM reasoning."""
+    protocols: dict[str, dict] = defaultdict(
+        lambda: {"source_file": "", "icd_codes": [], "chunks": []}
+    )
 
     for c in chunks:
         pid = c["protocol_id"]
-        header = ""
-        if pid not in seen_protocols:
-            seen_protocols.add(pid)
-            icds = ", ".join(c.get("icd_codes", [])[:8]) or "—"
-            header = f"\n### {c['source_file']} | МКБ-10: {icds}\n"
-        chunk_text = c.get("chunk", c.get("text", ""))
-        text = header + chunk_text
-        if total + len(text) > max_chars:
-            break
-        parts.append(text)
-        total += len(text)
+        if not protocols[pid]["source_file"]:
+            protocols[pid]["source_file"] = c.get("source_file", "")
+            protocols[pid]["icd_codes"] = c.get("icd_codes", [])
+        protocols[pid]["chunks"].append(c.get("chunk", c.get("text", "")))
+
+    parts: list[str] = []
+    total = 0
+    for pid, data in protocols.items():
+        src = data["source_file"]
+        icds = ", ".join(data["icd_codes"][:10]) or "—"
+        header = f"\n### Протокол: {src}\nКоды МКБ-10: {icds}\n"
+
+        protocol_text = header
+        for chunk_text in data["chunks"]:
+            candidate = protocol_text + "\n" + chunk_text
+            if total + len(candidate) > max_chars:
+                if protocol_text != header:
+                    break
+                chunk_text = chunk_text[: max_chars - total - len(header) - 10]
+                protocol_text += "\n" + chunk_text
+                break
+            protocol_text = candidate
+
+        if total + len(protocol_text) > max_chars:
+            if parts:
+                break
+        parts.append(protocol_text)
+        total += len(protocol_text)
 
     return "\n---\n".join(parts)
 
 
-def _collect_icd_list(chunks: list[dict], max_codes: int = 20) -> str:
-    """Collect a compact, unique list of ICD-10 codes from retrieved chunks."""
-    codes: list[str] = []
-    seen: set[str] = set()
+def _collect_icd_list(chunks: list[dict], max_codes: int = 30) -> str:
+    """Collect ICD-10 codes grouped by protocol for clarity."""
+    protocol_codes: dict[str, list[str]] = defaultdict(list)
+    seen_global: set[str] = set()
+    total = 0
+
     for c in chunks:
+        src = c.get("source_file", "Unknown")
         for code in c.get("icd_codes", []):
-            if code and code not in seen:
-                seen.add(code)
-                codes.append(code)
-            if len(codes) >= max_codes:
+            if code and code not in seen_global:
+                seen_global.add(code)
+                protocol_codes[src].append(code)
+                total += 1
+            if total >= max_codes:
                 break
-        if len(codes) >= max_codes:
+        if total >= max_codes:
             break
-    return ", ".join(codes) if codes else "нет явных кандидатов"
+
+    if not protocol_codes:
+        return "нет явных кандидатов"
+
+    parts = []
+    for src, codes in protocol_codes.items():
+        name = src.replace(".pdf", "")
+        parts.append(f"{name}: {', '.join(codes)}")
+    return "\n".join(parts)
 
 
 def build_prompt(symptoms: str, chunks: list[dict], top_n: int = 5) -> str:
-    """Build prompt string for LLM (legacy format)."""
+    """Build prompt string for LLM."""
     context = build_context(chunks)
     icd_list = _collect_icd_list(chunks)
     return DIAGNOSIS_PROMPT.format(

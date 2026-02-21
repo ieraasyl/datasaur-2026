@@ -84,6 +84,45 @@ def extract_icd_from_text(text: str) -> list[str]:
     return list(set(re.findall(r"\b[A-Z]\d{2}(?:\.\d{1,2})?\b", text)))
 
 
+# Patterns indicating questionnaire/survey content that pollutes retrieval
+_QUESTIONNAIRE_PATTERNS = [
+    re.compile(r"(?:0|1|2|3|4)\s*[.–—-]\s*.{5,60}\n", re.MULTILINE),
+    re.compile(r"(?:никогда|иногда|часто|всегда|редко|постоянно)", re.IGNORECASE),
+]
+
+_SCALE_KEYWORDS = [
+    "шкала", "опросник", "анкета", "тест бека", "epworth",
+    "что лучше описывает ваше состояние",
+    "за прошедшую неделю",
+    "баллов", "балл",
+]
+
+
+def is_questionnaire_chunk(text: str, threshold: float = 0.4) -> bool:
+    """Detect chunks that are primarily questionnaire/survey items."""
+    text_lower = text.lower()
+    keyword_hits = sum(1 for kw in _SCALE_KEYWORDS if kw in text_lower)
+    if keyword_hits >= 3:
+        return True
+    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+    if not lines:
+        return False
+    numbered_lines = sum(1 for l in lines if re.match(r"^\d+[\.\)]\s", l))
+    if len(lines) > 5 and numbered_lines / len(lines) > threshold:
+        return True
+    return False
+
+
+def enrich_chunk_text(chunk_text: str, source_file: str, icd_codes: list[str]) -> str:
+    """Prepend protocol name and ICD codes so the embedding captures medical context."""
+    protocol_name = source_file.replace(".pdf", "")
+    icd_str = ", ".join(icd_codes[:8]) if icd_codes else ""
+    header = f"Протокол: {protocol_name}"
+    if icd_str:
+        header += f" | МКБ-10: {icd_str}"
+    return f"{header}\n{chunk_text}"
+
+
 def load_protocols(corpus_path: Path) -> list[dict]:
     """Load protocols from JSON/JSONL files."""
     protocols: list[dict] = []
@@ -141,6 +180,7 @@ def main():
 
     # Chunk all protocols
     all_chunks: list[dict] = []
+    skipped_questionnaire = 0
     for proto in protocols:
         pid = proto.get("protocol_id", "")
         src = proto.get("source_file", "")
@@ -152,26 +192,32 @@ def main():
         found_icds = extract_icd_from_text(text)
         all_icds = list(set(icds + found_icds))
 
-        for idx, chunk in enumerate(chunk_by_sections(text, args.chunk_size, args.overlap)):
+        idx = 0
+        for chunk in chunk_by_sections(text, args.chunk_size, args.overlap):
+            if is_questionnaire_chunk(chunk):
+                skipped_questionnaire += 1
+                continue
+            enriched = enrich_chunk_text(chunk, src, all_icds)
             all_chunks.append({
                 "protocol_id": pid,
                 "source_file": src,
                 "title": title,
                 "icd_codes": all_icds,
                 "chunk": chunk,
+                "enriched_chunk": enriched,
                 "chunk_idx": idx,
-                "chunk_index": idx,  # Support both field names
-                "text": chunk,  # Support both field names
+                "chunk_index": idx,
+                "text": chunk,
             })
+            idx += 1
 
-    logger.info(f"Total chunks: {len(all_chunks)}")
+    logger.info(f"Total chunks: {len(all_chunks)} (filtered {skipped_questionnaire} questionnaire chunks)")
 
-    # Embed all chunks using the Embedder class (handles E5 prefixes correctly)
+    # Embed enriched chunks (with protocol metadata for better retrieval)
     logger.info("Embedding chunks (may take several minutes on CPU)...")
     from src.rag.embedder import Embedder
     embedder = Embedder()
-    texts = [c["chunk"] for c in all_chunks]
-    # Embedder.encode() automatically adds 'passage: ' prefix for corpus chunks
+    texts = [c["enriched_chunk"] for c in all_chunks]
     embeddings = embedder.encode(texts, batch_size=64, is_query=False)
     logger.info(f"Embeddings shape: {embeddings.shape}")
 
