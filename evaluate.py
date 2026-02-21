@@ -190,7 +190,7 @@ def compute_metrics(results: list[EvaluationResult]) -> dict:
 
 def write_jsonl(results: list[EvaluationResult], output_path: Path):
     """Write results to JSONL file."""
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         for r in results:
             line = {
                 "protocol_id": r.protocol_id,
@@ -213,8 +213,8 @@ def write_metrics_json(submission_name: str, metrics: dict, output_path: Path):
         "submission_name": submission_name,
         **metrics,
     }
-    with open(output_path, "w") as f:
-        json.dump(output_data, f, indent=2)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, indent=2, ensure_ascii=False)
 
 
 def display_summary(

@@ -16,12 +16,6 @@ node_modules/
 frontend/dist/
 .astro/
 
-# Data / indexes (too large for git)
-backend/data/index/
-backend/data/corpus/
-
-# Evals output
-data/evals/
 
 # Misc
 .DS_Store
