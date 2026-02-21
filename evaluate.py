@@ -42,7 +42,7 @@ async def evaluate_single(
 ) -> EvaluationResult:
     """Evaluate a single protocol against the endpoint."""
     async with semaphore:
-        with open(json_file, "r") as f:
+        with open(json_file, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         protocol_id = data["protocol_id"]
