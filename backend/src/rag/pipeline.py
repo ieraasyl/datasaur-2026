@@ -42,7 +42,6 @@ class RAGPipeline:
         return False
 
     def is_ready(self) -> bool:
-        """Check if pipeline is ready to process requests."""
         return self._ready
 
     async def diagnose(self, symptoms: str, top_n: int = TOP_N_DIAG) -> DiagnoseResponse:
@@ -50,18 +49,13 @@ class RAGPipeline:
         if not self._ready:
             raise RuntimeError("Pipeline not initialized — indexes not loaded.")
 
-        # 1. Embed query
         q_vec = self.embedder.encode_query(symptoms)
-
-        # 2. Hybrid retrieve
         chunks = self.retriever.search(symptoms, q_vec, k=TOP_K)
         logger.info(f"Retrieved {len(chunks)} chunks for query.")
 
-        # 3. Build prompt & call LLM
         prompt = build_prompt(symptoms, chunks, top_n=top_n)
         raw_diagnoses = await self.llm.diagnose(prompt, chunks, top_n=top_n)
 
-        # 4. Validate & coerce into Pydantic models
         diagnoses = []
         for i, d in enumerate(raw_diagnoses[:top_n]):
             try:
@@ -77,7 +71,6 @@ class RAGPipeline:
         return DiagnoseResponse(diagnoses=diagnoses)
 
 
-# Legacy function interface for backward compatibility
 async def diagnose(symptoms: str | None) -> DiagnoseResponse:
     """Legacy function interface - uses singleton pipeline."""
     symptoms = symptoms or ""
@@ -88,7 +81,7 @@ async def diagnose(symptoms: str | None) -> DiagnoseResponse:
 
     from src.rag.prompt import build_prompt_messages
     messages = build_prompt_messages(symptoms, chunks)
-    
+
     from src.rag import llm
     raw = await llm.complete(messages, chunks)
 
@@ -97,7 +90,6 @@ async def diagnose(symptoms: str | None) -> DiagnoseResponse:
         diagnoses = [Diagnosis(**d) for d in data.get("diagnoses", [])]
     except Exception as e:
         logger.warning(f"[Pipeline] Failed to parse LLM response: {e}\nRaw: {raw}")
-        # Fallback: return top chunk's ICD codes
         diagnoses = []
         for rank, chunk in enumerate(chunks[:3], start=1):
             codes = chunk.get("icd_codes", [])

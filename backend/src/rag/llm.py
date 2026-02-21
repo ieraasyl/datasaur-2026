@@ -5,17 +5,14 @@ import re
 
 from openai import AsyncOpenAI
 
-from src.config import settings
+from src.config import settings, TOP_N_DIAG
 
 logger = logging.getLogger(__name__)
 
-TOP_N_DIAG = 5  # Default number of diagnoses to return
-
 
 def _parse_json_diagnoses(text: str) -> list[dict] | None:
-    """Extract and parse a JSON array from LLM response text."""
+    """Extract and parse a JSON array/object from LLM response text."""
     text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
-    # Try direct parse first
     try:
         data = json.loads(text)
         if isinstance(data, list):
@@ -24,8 +21,7 @@ def _parse_json_diagnoses(text: str) -> list[dict] | None:
             return data["diagnoses"]
     except json.JSONDecodeError:
         pass
-    # Try to find JSON array in the text
-    match = re.search(r"\[.*?\]", text, re.DOTALL)
+    match = re.search(r"\[.*\]", text, re.DOTALL)
     if match:
         try:
             data = json.loads(match.group())
@@ -37,20 +33,13 @@ def _parse_json_diagnoses(text: str) -> list[dict] | None:
 
 
 def mock_response(chunks: list[dict], top_n: int = TOP_N_DIAG) -> list[dict]:
-    """Fallback: build diagnoses directly from retrieved chunk metadata (no LLM).
-
-    Стратегия:
-    - усиливаем влияние rrf_score (релевантность чанка);
-    - учитываем, в скольких разных чанках встречается один и тот же код (стабильность кода);
-    - по возможности поднимаем более специфические коды (с десятичной частью).
-    """
+    """Fallback: build diagnoses directly from retrieved chunk metadata (no LLM)."""
     icd_scores: dict[str, float] = {}
     icd_meta: dict[str, dict] = {}
     icd_chunk_count: dict[str, int] = {}
 
     for c in chunks:
         base_score = c.get("rrf_score", c.get("dense_score", c.get("sparse_score", 0.5)))
-        # слегка усиливаем вклад высокоранговых чанков
         score = float(base_score) ** 1.2
         seen_here: set[str] = set()
         for icd in c.get("icd_codes", []):
@@ -59,13 +48,11 @@ def mock_response(chunks: list[dict], top_n: int = TOP_N_DIAG) -> list[dict]:
             icd_scores[icd] = icd_scores.get(icd, 0.0) + score
             if icd not in icd_meta:
                 icd_meta[icd] = c
-            # считаем, в скольких чанках встречается код
             if icd not in seen_here:
                 seen_here.add(icd)
                 icd_chunk_count[icd] = icd_chunk_count.get(icd, 0) + 1
 
     def _specificity_bonus(code: str) -> float:
-        """Бонус за более специфический (с десятичной частью) код."""
         return 1.1 if "." in code else 1.0
 
     def _final_score(item: tuple[str, float]) -> float:
@@ -77,15 +64,14 @@ def mock_response(chunks: list[dict], top_n: int = TOP_N_DIAG) -> list[dict]:
     results = []
     for rank, (icd, _) in enumerate(ranked, 1):
         meta = icd_meta[icd]
-        # Handle both 'chunk' and 'text' field names
         chunk_text = meta.get("chunk", meta.get("text", ""))
         results.append({
             "rank": rank,
             "diagnosis": meta.get("title", meta.get("source_file", "Диагноз")),
             "icd10_code": icd,
             "explanation": (
-                f"Симптомы соответствуют протоколу {meta['source_file']}. "
-                f"{chunk_text[:180].strip()}..."
+                f"Код {icd} из протокола {meta['source_file']}. "
+                f"{chunk_text[:150].strip()}..."
             ),
         })
     return results
@@ -95,17 +81,17 @@ class LLMClient:
     """LLM client with fallback to mock mode."""
 
     def __init__(self):
-        self._client = None
+        self._client: AsyncOpenAI | None = None
 
-    def _get_client(self):
+    def _get_client(self) -> AsyncOpenAI | None:
         """Lazy initialize OpenAI client."""
         if self._client is None:
-    if not settings.gpt_oss_api_key:
-        return None
+            if not settings.gpt_oss_api_key:
+                return None
             self._client = AsyncOpenAI(
-        base_url=settings.gpt_oss_url,
-        api_key=settings.gpt_oss_api_key,
-    )
+                base_url=settings.gpt_oss_url,
+                api_key=settings.gpt_oss_api_key,
+            )
         return self._client
 
     async def diagnose(
@@ -114,11 +100,11 @@ class LLMClient:
         chunks: list[dict],
         top_n: int = TOP_N_DIAG,
     ) -> list[dict]:
-        """Call GPT-OSS and return parsed diagnoses. Falls back to mock on any error."""
+        """Call GPT-OSS and return parsed diagnoses. Falls back to mock on error."""
         from src.rag.prompt import SYSTEM_PROMPT
 
         client = self._get_client()
-        if settings.mock_llm or client is None or not settings.gpt_oss_api_key:
+        if settings.mock_llm or client is None:
             logger.warning("MOCK_LLM=true or no API key — using retrieval-based fallback.")
             return mock_response(chunks, top_n)
 
@@ -130,13 +116,12 @@ class LLMClient:
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.1,
-                max_tokens=1500,
+                max_tokens=1024,
             )
             raw = response.choices[0].message.content or ""
             logger.debug(f"LLM raw response (first 300 chars): {raw[:300]}")
             parsed = _parse_json_diagnoses(raw)
             if parsed:
-                # Enforce rank field and clamp to top_n
                 for i, d in enumerate(parsed[:top_n]):
                     d["rank"] = i + 1
                 return parsed[:top_n]
@@ -148,11 +133,9 @@ class LLMClient:
             return mock_response(chunks, top_n)
 
 
-# Legacy function interface for backward compatibility
 async def complete(messages: list[dict], chunks: list[dict]) -> str:
     """Legacy function interface - returns JSON string."""
     client = LLMClient()
-    # Extract symptoms from messages if possible
     user_msg = next((m["content"] for m in messages if m["role"] == "user"), "")
     diagnoses = await client.diagnose(user_msg, chunks)
-        return json.dumps({"diagnoses": diagnoses}, ensure_ascii=False)
+    return json.dumps({"diagnoses": diagnoses}, ensure_ascii=False)
