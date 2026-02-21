@@ -49,7 +49,7 @@ class RAGPipeline:
         if not self._ready:
             raise RuntimeError("Pipeline not initialized — indexes not loaded.")
 
-        q_vec = self.embedder.encode_query(symptoms)
+        q_vec = self.embedder.encode(symptoms)
         chunks = self.retriever.search(symptoms, q_vec, k=TOP_K)
         logger.info(f"Retrieved {len(chunks)} chunks for query.")
 
@@ -75,7 +75,7 @@ async def diagnose(symptoms: str | None) -> DiagnoseResponse:
     """Legacy function interface - uses singleton pipeline."""
     symptoms = symptoms or ""
     embedder = get_embedder()
-    query_embedding = embedder.encode_query(symptoms)
+    query_embedding = embedder.encode(symptoms)
 
     chunks = hybrid_search(symptoms, query_embedding)
 
