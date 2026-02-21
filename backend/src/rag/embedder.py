@@ -54,3 +54,13 @@ class Embedder:
     def encode_query(self, query: str) -> np.ndarray:
         """Embed a single query string with the correct 'query: ' prefix."""
         return self.encode([query], is_query=True)[0]
+
+
+_embedder: Embedder | None = None
+
+def get_embedder() -> Embedder:
+    """Get singleton Embedder instance."""
+    global _embedder
+    if _embedder is None:
+        _embedder = Embedder()
+    return _embedder
