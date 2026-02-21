@@ -2,7 +2,9 @@
 from pydantic_settings import BaseSettings
 from pathlib import Path
 
-BASE_DIR = Path(__file__).parent.parent  # backend/
+BASE_DIR = Path(__file__).resolve().parent.parent        # backend/
+PROJECT_ROOT = BASE_DIR.parent                           # datasaur-2026/
+_env_path = PROJECT_ROOT / ".env"
 
 
 class Settings(BaseSettings):
