@@ -1,4 +1,4 @@
-"""Orchestrates: embed → hybrid retrieve → prompt → LLM → parse."""
+"""Orchestrates: embed → hybrid retrieve → rerank → prompt → LLM → parse."""
 import json
 import logging
 
@@ -24,6 +24,14 @@ class RAGPipeline:
         self.retriever: HybridRetriever | None = None
         self.llm = LLMClient()
         self._ready = False
+        self._reranker = None
+        if settings.use_reranker:
+            try:
+                from src.rag.reranker import CrossEncoderReranker
+                self._reranker = CrossEncoderReranker()
+                logger.info("Cross-encoder reranker initialized.")
+            except Exception as e:
+                logger.warning(f"Failed to initialize reranker: {e}. Continuing without reranker.")
 
     def load_indexes(self) -> bool:
         """Load pre-built FAISS + BM25 indexes from disk."""
@@ -51,7 +59,15 @@ class RAGPipeline:
 
         q_vec = self.embedder.encode(symptoms)
         chunks = self.retriever.search(symptoms, q_vec, k=TOP_K)
-        logger.info(f"Retrieved {len(chunks)} chunks for query.")
+        logger.info(f"Retrieved {len(chunks)} chunks for query (before re-ranking).")
+
+        # 2b. Optional cross-encoder re-ranking to improve Accuracy@1
+        if self._reranker is not None:
+            try:
+                chunks = self._reranker.rerank(symptoms, chunks, top_k=TOP_K)
+                logger.info(f"Chunks re-ranked with cross-encoder (top {len(chunks)} chunks).")
+            except Exception as exc:
+                logger.warning(f"Reranker failed, falling back to hybrid ranking only: {exc}")
 
         prompt = build_prompt(symptoms, chunks, top_n=top_n)
         raw_diagnoses = await self.llm.diagnose(prompt, chunks, top_n=top_n)
@@ -78,6 +94,16 @@ async def diagnose(symptoms: str | None) -> DiagnoseResponse:
     query_embedding = embedder.encode(symptoms)
 
     chunks = hybrid_search(symptoms, query_embedding)
+
+    # Optional re-ranking for legacy path as well
+    if settings.use_reranker:
+        try:
+            from src.rag.reranker import CrossEncoderReranker
+            reranker = CrossEncoderReranker()
+            chunks = reranker.rerank(symptoms, chunks, top_k=TOP_K)
+            logger.debug("Legacy path: chunks re-ranked with cross-encoder.")
+        except Exception as _exc:
+            logger.warning(f"[Pipeline] Legacy reranker failed, ignoring: {_exc}")
 
     from src.rag.prompt import build_prompt_messages
     messages = build_prompt_messages(symptoms, chunks)

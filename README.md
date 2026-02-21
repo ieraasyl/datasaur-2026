@@ -5,8 +5,19 @@ AI-powered clinical decision support system using Kazakhstan clinical protocols 
 ## Architecture
 
 ```
-Symptoms (text) → Hybrid RAG (FAISS + BM25) → GPT-OSS (oss-120b) → Ranked diagnoses + ICD-10 codes
+Symptoms (text) 
+  → Embed (multilingual-e5-small)
+  → Hybrid Retrieval (FAISS dense + BM25 sparse + RRF fusion)
+  → Cross-Encoder Re-ranking (mmarco-mMiniLMv2, optional)
+  → GPT-OSS (oss-120b) with ICD-10 constrained prompt
+  → Ranked diagnoses + ICD-10 codes
 ```
+
+**Key improvements:**
+- **Better embeddings**: `intfloat/multilingual-e5-small` (~120MB, excellent Russian support)
+- **Cross-encoder reranker**: Improves Accuracy@1 by re-scoring top chunks
+- **Protocol-aware chunking**: Prioritizes diagnostic criteria sections
+- **ICD-10 constrained prompts**: Reduces hallucinated codes
 
 Single Docker container on port 8080. FastAPI backend serves Astro static frontend.
 
@@ -34,7 +45,19 @@ cp .env.example .env
 unzip corpus.zip -d backend/data/corpus/
 ```
 
-### 3. Build indexes (one-time, run on your machine)
+### 3. Build indexes (one-time)
+
+**Option A: Build on GPU (Recommended — much faster)**
+
+For best performance, build indexes on Colab/Kaggle with GPU:
+
+1. Upload `backend/scripts/index_corpus.py` and corpus to Colab/Kaggle
+2. Install dependencies: `pip install sentence-transformers faiss-cpu rank-bm25 torch numpy`
+3. Run: `python index_corpus.py --corpus ./corpus`
+4. Download the generated `data/index/` folder
+5. Place it in `backend/data/index/` in your local repo
+
+**Option B: Build locally (CPU — slower but works)**
 
 ```bash
 cd backend
@@ -43,6 +66,10 @@ uv sync
 python scripts/index_corpus.py
 # Creates: backend/data/index/faiss.index, bm25.pkl, metadata.pkl
 ```
+
+**Option C: Use pre-built indexes from GitHub Releases**
+
+If indexes are too large for git, download from GitHub Releases and extract to `backend/data/index/`.
 
 ### 4. Validate response format early
 

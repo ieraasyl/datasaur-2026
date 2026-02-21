@@ -14,7 +14,10 @@ SYSTEM_PROMPT = """Ты — AI-ассистент клинической диа�
 DIAGNOSIS_PROMPT = """## Симптомы:
 {symptoms}
 
-## Протоколы (коды МКБ-10 указаны в заголовках):
+## Возможные коды МКБ-10 из найденных протоколов:
+{icd_list}
+
+## Релевантные клинические протоколы РК:
 {context}
 
 Определи до {top_n} наиболее вероятных диагнозов. Используй ТОЛЬКО коды из протоколов выше.
@@ -44,16 +47,44 @@ def build_context(chunks: list[dict], max_chars: int = 6000) -> str:
     return "\n---\n".join(parts)
 
 
-def build_prompt(symptoms: str, chunks: list[dict], top_n: int = 3) -> str:
-    """Build prompt string for LLM."""
+def _collect_icd_list(chunks: list[dict], max_codes: int = 20) -> str:
+    """Collect a compact, unique list of ICD-10 codes from retrieved chunks."""
+    codes: list[str] = []
+    seen: set[str] = set()
+    for c in chunks:
+        for code in c.get("icd_codes", []):
+            if code and code not in seen:
+                seen.add(code)
+                codes.append(code)
+            if len(codes) >= max_codes:
+                break
+        if len(codes) >= max_codes:
+            break
+    return ", ".join(codes) if codes else "нет явных кандидатов"
+
+
+def build_prompt(symptoms: str, chunks: list[dict], top_n: int = 5) -> str:
+    """Build prompt string for LLM (legacy format)."""
     context = build_context(chunks)
-    return DIAGNOSIS_PROMPT.format(symptoms=symptoms, context=context, top_n=top_n)
+    icd_list = _collect_icd_list(chunks)
+    return DIAGNOSIS_PROMPT.format(
+        symptoms=symptoms,
+        context=context,
+        top_n=top_n,
+        icd_list=icd_list,
+    )
 
 
 def build_prompt_messages(symptoms: str, chunks: list[dict], top_n: int = 3) -> list[dict]:
     """Build prompt as messages list for OpenAI API."""
     context = build_context(chunks)
-    user_message = DIAGNOSIS_PROMPT.format(symptoms=symptoms, context=context, top_n=top_n)
+    icd_list = _collect_icd_list(chunks)
+    user_message = DIAGNOSIS_PROMPT.format(
+        symptoms=symptoms,
+        context=context,
+        top_n=top_n,
+        icd_list=icd_list,
+    )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_message},

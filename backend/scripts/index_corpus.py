@@ -1,136 +1,210 @@
 """
-Run once to build FAISS + BM25 indexes from the corpus.
+index_corpus.py — One-time script to parse protocols, chunk, embed, and build
+FAISS + BM25 indexes. Run from the backend/ directory:
 
-Usage:
-    cd datasaur-2026/backend
-    uv run python scripts/index_corpus.py
+    uv run python scripts/index_corpus.py [--corpus data/corpus] [--chunk-size 600]
+
+For GPU-accelerated indexing, run on Colab/Kaggle and upload the index files
+via GitHub Releases (see README).
 """
 
+import argparse
 import json
-import pickle
+import logging
+import re
 import sys
 from pathlib import Path
 
-import faiss
-import numpy as np
-from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
-import torch
+# Allow imports from backend/src
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Paths
-BACKEND_DIR = Path(__file__).parent.parent
-CORPUS_DIR = BACKEND_DIR / "data" / "corpus"
-INDEX_DIR = BACKEND_DIR / "data" / "index"
-INDEX_DIR.mkdir(parents=True, exist_ok=True)
-
-EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-CHUNK_SIZE = 600   # tokens approx (chars / 4)
-CHUNK_OVERLAP = 100
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Simple character-based chunking with overlap."""
-    words = text.split()
-    chunks = []
-    i = 0
-    while i < len(words):
-        chunk_words = words[i:i + chunk_size]
-        chunks.append(" ".join(chunk_words))
-        i += chunk_size - overlap
-    return [c for c in chunks if len(c.strip()) > 50]
+# ── Text chunking with protocol-aware splitting ──────────────────────────────
+
+# Kazakh clinical protocol section headers — split on these for logical chunking
+SECTION_RE = re.compile(
+    r"(?:^|\n)(?=(?:I{1,3}V?|VI{0,3}|[1-9]\d*)\.\s+[А-ЯA-Z])",
+    re.MULTILINE,
+)
+
+# Diagnostic criteria keywords (high-value sections for symptom matching)
+DIAGNOSTIC_KEYWORDS = [
+    "диагностические критерии",
+    "жалобы",
+    "лабораторные исследования",
+    "клинические признаки",
+    "симптомы",
+    "диагностика",
+    "критерии диагноза",
+]
 
 
-def load_corpus() -> list[dict]:
-    protocols = []
-    for path in sorted(CORPUS_DIR.glob("*.json")):
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            protocols.extend(data)
+def chunk_by_sections(text: str, chunk_size: int, overlap: int) -> list[str]:
+    """
+    Split on protocol section headers first, then by word count.
+    Prioritizes diagnostic criteria sections for better symptom matching.
+    """
+    # First, try to split on section headers
+    sections = SECTION_RE.split(text)
+    sections = [s.strip() for s in sections if s.strip()]
+    
+    if not sections:
+        # Fallback: treat entire text as one section
+        sections = [text]
+
+    chunks: list[str] = []
+    for section in sections:
+        # Check if this section contains diagnostic keywords (higher priority)
+        section_lower = section.lower()
+        is_diagnostic_section = any(kw in section_lower for kw in DIAGNOSTIC_KEYWORDS)
+        
+        words = section.split()
+        if len(words) <= chunk_size:
+            chunks.append(section)
         else:
-            protocols.append(data)
+            # Sliding window within long sections
+            # Use smaller overlap for diagnostic sections to preserve more context
+            section_overlap = overlap // 2 if is_diagnostic_section else overlap
+            start = 0
+            while start < len(words):
+                end = min(start + chunk_size, len(words))
+                chunks.append(" ".join(words[start:end]))
+                if end == len(words):
+                    break
+                start += chunk_size - section_overlap
+    
+    return chunks
 
-    for path in sorted(CORPUS_DIR.glob("*.jsonl")):
-        with open(path, encoding="utf-8") as f:
+
+def extract_icd_from_text(text: str) -> list[str]:
+    """Extract ICD-10 codes from text using regex."""
+    return list(set(re.findall(r"\b[A-Z]\d{2}(?:\.\d{1,2})?\b", text)))
+
+
+def load_protocols(corpus_path: Path) -> list[dict]:
+    """Load protocols from JSON/JSONL files."""
+    protocols: list[dict] = []
+    # Support .jsonl files (one JSON object per line)
+    for fpath in sorted(corpus_path.glob("**/*.jsonl")):
+        with open(fpath, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
                     protocols.append(json.loads(line))
-
-    print(f"Loaded {len(protocols)} protocols")
+    # Support single .json list files
+    for fpath in sorted(corpus_path.glob("**/*.json")):
+        # Skip if it's a test file or response file
+        if "test" in fpath.name.lower() or "response" in fpath.name.lower():
+            continue
+        with open(fpath, encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                protocols.extend(data)
+            elif isinstance(data, dict):
+                protocols.append(data)
+    logger.info(f"Loaded {len(protocols)} protocols from {corpus_path}")
     return protocols
 
 
-def build_chunks(protocols: list[dict]) -> list[dict]:
-    chunks = []
-    for protocol in protocols:
-        text = protocol.get("text", "")
-        if not text.strip():
-            continue
-        for i, chunk_text_str in enumerate(chunk_text(text)):
-            chunks.append({
-                "protocol_id": protocol.get("protocol_id", ""),
-                "source_file": protocol.get("source_file", ""),
-                "title": protocol.get("title", ""),
-                "icd_codes": protocol.get("icd_codes", []),
-                "chunk_index": i,
-                "text": chunk_text_str,
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--corpus", default="data/corpus", help="Corpus directory")
+    parser.add_argument("--chunk-size", type=int, default=600, help="Chunk size (words)")
+    parser.add_argument("--overlap", type=int, default=100, help="Overlap (words)")
+    args = parser.parse_args()
+
+    from src.config import settings
+    import faiss
+    import numpy as np
+    import torch
+    from sentence_transformers import SentenceTransformer
+    from rank_bm25 import BM25Okapi
+    import pickle
+    
+    corpus_path = Path(args.corpus)
+    if not corpus_path.exists():
+        corpus_path = settings.corpus_dir
+    if not corpus_path.exists():
+        logger.error(f"Corpus path not found: {corpus_path}")
+        sys.exit(1)
+
+    # Load protocols
+    protocols = load_protocols(corpus_path)
+    if not protocols:
+        logger.error("No protocols found! Check corpus path and file format.")
+        sys.exit(1)
+
+    # Chunk all protocols
+    all_chunks: list[dict] = []
+    for proto in protocols:
+        pid = proto.get("protocol_id", "")
+        src = proto.get("source_file", "")
+        title = proto.get("title", "")
+        icds = proto.get("icd_codes", [])
+        text = proto.get("text", "")
+
+        # Merge ICD codes from text as well
+        found_icds = extract_icd_from_text(text)
+        all_icds = list(set(icds + found_icds))
+
+        for idx, chunk in enumerate(chunk_by_sections(text, args.chunk_size, args.overlap)):
+            all_chunks.append({
+                "protocol_id": pid,
+                "source_file": src,
+                "title": title,
+                "icd_codes": all_icds,
+                "chunk": chunk,
+                "chunk_idx": idx,
+                "chunk_index": idx,  # Support both field names
+                "text": chunk,  # Support both field names
             })
-    print(f"Built {len(chunks)} chunks from {len(protocols)} protocols")
-    return chunks
 
+    logger.info(f"Total chunks: {len(all_chunks)}")
 
-def build_faiss_index(chunks: list[dict], model: SentenceTransformer) -> None:
-    print("Building FAISS index...")
-    texts = [c["text"] for c in chunks]
-    embeddings = model.encode(texts, batch_size=64, show_progress_bar=True, normalize_embeddings=True)
-    embeddings = np.array(embeddings, dtype=np.float32)
+    # Embed all chunks using the Embedder class (handles E5 prefixes correctly)
+    logger.info("Embedding chunks (may take several minutes on CPU)...")
+    from src.rag.embedder import Embedder
+    embedder = Embedder()
+    texts = [c["chunk"] for c in all_chunks]
+    # Embedder.encode() automatically adds 'passage: ' prefix for corpus chunks
+    embeddings = embedder.encode(texts, batch_size=64, is_query=False)
+    logger.info(f"Embeddings shape: {embeddings.shape}")
 
+    # Build & save FAISS index
+    index_dir = settings.index_dir
+    index_dir.mkdir(parents=True, exist_ok=True)
+    
+    logger.info("Building FAISS index...")
     dim = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
+    faiss.write_index(index, str(index_dir / "faiss.index"))
+    logger.info(f"✅ FAISS index saved: {index.ntotal} vectors (dim={dim})")
 
-    faiss.write_index(index, str(INDEX_DIR / "faiss.index"))
-    print(f"Saved FAISS index: {index.ntotal} vectors, dim={dim}")
-
-
-def build_bm25_index(chunks: list[dict]) -> None:
-    print("Building BM25 index...")
-    tokenized = [c["text"].lower().split() for c in chunks]
+    # Build & save BM25 index
+    logger.info("Building BM25 index...")
+    from src.rag.bm25 import _tokenize
+    tokenized = [_tokenize(c.get("chunk", c.get("text", ""))) for c in all_chunks]
     bm25 = BM25Okapi(tokenized)
+    
+    with open(index_dir / "bm25.pkl", "wb") as f:
+        pickle.dump({"bm25": bm25, "metadata": all_chunks}, f)
+    logger.info(f"✅ BM25 index saved: {len(all_chunks)} documents")
 
-    with open(INDEX_DIR / "bm25.pkl", "wb") as f:
-        pickle.dump({"bm25": bm25, "metadata": chunks}, f)
-    print(f"Saved BM25 index: {len(chunks)} chunks")
+    # Save metadata
+    with open(index_dir / "metadata.pkl", "wb") as f:
+        pickle.dump(all_chunks, f)
+    logger.info("✅ Metadata saved")
 
-
-def save_metadata(chunks: list[dict]) -> None:
-    with open(INDEX_DIR / "metadata.pkl", "wb") as f:
-        pickle.dump(chunks, f)
-    print("Saved metadata.pkl")
-
-
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-    print("Loading embedding model...")
-    model = SentenceTransformer(EMBED_MODEL, device=device)
-
-    protocols = load_corpus()
-    if not protocols:
-        print("ERROR: No protocols found in", CORPUS_DIR)
-        sys.exit(1)
-
-    chunks = build_chunks(protocols)
-    build_faiss_index(chunks, model)
-    build_bm25_index(chunks)
-    save_metadata(chunks)
-
-    print("\nDone! Index files written to:", INDEX_DIR)
-    for f in INDEX_DIR.iterdir():
-        print(f"  {f.name} ({f.stat().st_size / 1024 / 1024:.1f} MB)")
+    logger.info(f"\n✅ Indexing complete! Indexes saved to {index_dir}")
+    for f in index_dir.iterdir():
+        size_mb = f.stat().st_size / 1024 / 1024
+        logger.info(f"   {f.name} ({size_mb:.1f} MB)")
 
 
 if __name__ == "__main__":
